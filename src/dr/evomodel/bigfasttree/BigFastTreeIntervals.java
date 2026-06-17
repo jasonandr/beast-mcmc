@@ -52,7 +52,8 @@ public class BigFastTreeIntervals extends AbstractModel implements Units, TreeIn
     // Benchmarking hook only. When false, store/restore copy the entire events
     // structure (the original pre-incremental behaviour). Production default is
     // true (copy only the touched [dirtyLo, dirtyHi] slice).
-    public static boolean INCREMENTAL_STORE_RESTORE = true;
+    public static boolean INCREMENTAL_STORE_RESTORE =
+            !"false".equalsIgnoreCase(System.getProperty("beast.bigfasttree.incremental", "true"));
 
     public BigFastTreeIntervals(TreeModel tree) {
         this("bigFastIntervals",tree);

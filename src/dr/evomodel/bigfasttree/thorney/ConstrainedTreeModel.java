@@ -851,7 +851,8 @@ public class ConstrainedTreeModel extends TreeModel {
     // Incremental store/restore bookkeeping (see storeState/restoreState).
     // Benchmarking hook INCREMENTAL_STORE_RESTORE=false restores the original
     // full O(N) arraycopy (store) + pointer-swap (restore) behaviour.
-    public static boolean INCREMENTAL_STORE_RESTORE = true;
+    public static boolean INCREMENTAL_STORE_RESTORE =
+            !"false".equalsIgnoreCase(System.getProperty("beast.bigfasttree.incremental", "true"));
     private int[] changedHeights = new int[16];
     private int changedHeightCount = 0;
     private boolean heightsStoreFull = true;

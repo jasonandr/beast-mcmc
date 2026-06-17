@@ -57,7 +57,8 @@ public class BigFastTreeModel extends TreeModel {
     // full O(N) arraycopy (store) + pointer-swap (restore). Production default
     // is true: store/restore touch only the heights changed this iteration and
     // skip the edges array entirely unless the topology changed.
-    public static boolean INCREMENTAL_STORE_RESTORE = true;
+    public static boolean INCREMENTAL_STORE_RESTORE =
+            !"false".equalsIgnoreCase(System.getProperty("beast.bigfasttree.incremental", "true"));
 
     public BigFastTreeModel(Tree tree) {
         this(BIG_FAST_TREE_MODEL, tree, false, false);

@@ -433,7 +433,8 @@ public final class CoalescentLikelihood extends AbstractCoalescentLikelihood imp
 	// Incremental cache: per-interval contribution to logL, recomputed only for
 	// intervals the tree change touched. INCREMENTAL=false falls back to the
 	// original full computation (used for A/B timing and as an escape hatch).
-	public static boolean INCREMENTAL = true;
+	public static boolean INCREMENTAL =
+			!"false".equalsIgnoreCase(System.getProperty("beast.bigfasttree.incremental", "true"));
 	private double[] intervalContribution;
 	private double[] storedIntervalContribution;
 	private boolean contribValid = false;
