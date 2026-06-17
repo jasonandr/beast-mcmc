@@ -114,6 +114,27 @@ public class BigFastTreeIntervals extends AbstractModel implements Units, TreeIn
         return intervalCount;
     }
 
+    /**
+     * Interval indices that may have changed since the last store, as {lo, hi}
+     * (inclusive); lo &gt; hi means no interval changed. Returns the full range
+     * {0, intervalCount-1} when fully dirty. Lets a consumer (e.g. a coalescent
+     * likelihood) recompute only the affected intervals instead of all of them.
+     * An event at position p bounds intervals p-1 and p, so the event-position
+     * dirty range [dirtyLo, dirtyHi] maps to intervals [dirtyLo-1, dirtyHi].
+     * Valid after calculateIntervals() has run.
+     */
+    public int[] getUpdatedIntervalRange() {
+        if (!intervalsKnown) {
+            calculateIntervals();
+        }
+        if (dirtyLo > dirtyHi) {
+            return new int[]{0, -1};
+        }
+        int lo = Math.max(0, dirtyLo - 1);
+        int hi = Math.min(intervalCount - 1, dirtyHi);
+        return new int[]{lo, hi};
+    }
+
     @Override
     public int getSampleCount() {
         return tree.getTaxonCount();

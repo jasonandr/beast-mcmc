@@ -31,6 +31,8 @@ import dr.evolution.coalescent.DemographicFunction;
 import dr.evolution.coalescent.IntervalList;
 import dr.evolution.coalescent.IntervalType;
 import dr.evolution.util.Units;
+import dr.evomodel.bigfasttree.BigFastTreeIntervals;
+import dr.inference.model.Model;
 import dr.evomodel.coalescent.demographicmodel.DemographicModel;
 import dr.evomodel.coalescent.piecewise.PopulationSizeFunction;
 import dr.evomodel.coalescent.piecewise.PopulationSizeModel;
@@ -119,9 +121,22 @@ public final class CoalescentLikelihood extends AbstractCoalescentLikelihood imp
 
 	/**
 	 * Calculates the log likelihood of this set of coalescent intervals,
-	 * given a demographic model.
+	 * given a demographic model. Dispatches to an incremental implementation
+	 * when the interval list supports per-interval dirty tracking.
 	 */
 	protected double calculateLogLikelihood(DemographicModel demographicModel) {
+		if (INCREMENTAL && getIntervalList() instanceof BigFastTreeIntervals) {
+			return calculateLogLikelihoodIncremental(demographicModel);
+		}
+		return calculateLogLikelihoodFull(demographicModel);
+	}
+
+	/**
+	 * The original full O(N) computation (cumulative interval start times). Used
+	 * when the incremental cache cannot apply (non-BigFastTree intervals, or the
+	 * INCREMENTAL flag is off).
+	 */
+	protected double calculateLogLikelihoodFull(DemographicModel demographicModel) {
 
 		double logL = 0.0;
 
@@ -178,6 +193,89 @@ public final class CoalescentLikelihood extends AbstractCoalescentLikelihood imp
 		return logL;
 	}
 
+	/**
+	 * Incremental version. Caches each interval's contribution to logL and, when
+	 * only the tree changed, recomputes only the contributions of the intervals
+	 * the change touched (the expensive getIntegral / getDemographic calls),
+	 * then sums the cached array. Each interval's start time is taken from the
+	 * absolute event time (getIntervalTime(i) - getStartTime()), which is
+	 * mathematically identical to the original cumulative sum but depends only on
+	 * that interval, so contributions outside the changed range stay valid. A
+	 * demographic-parameter change invalidates the whole cache (every interval's
+	 * contribution depends on the demographic function).
+	 */
+	protected double calculateLogLikelihoodIncremental(DemographicModel demographicModel) {
+
+		BigFastTreeIntervals intervals = (BigFastTreeIntervals) getIntervalList();
+
+		final int n = intervals.getIntervalCount();
+
+		if (n == 0) {
+			contribValid = false;
+			return 0.0;
+		}
+
+		final double absoluteStartTime = intervals.getStartTime();
+		demographicModel.setTimeOffset(absoluteStartTime);
+		final DemographicFunction demographicFunction = demographicModel.getDemographicFunction();
+
+		final boolean full = !contribValid
+				|| intervalContribution == null
+				|| intervalContribution.length != n
+				|| demographicChanged
+				|| absoluteStartTime != cachedAbsoluteStartTime;
+
+		int lo, hi;
+		if (full) {
+			if (intervalContribution == null || intervalContribution.length != n) {
+				intervalContribution = new double[n];
+			}
+			lo = 0;
+			hi = n - 1;
+		} else {
+			int[] range = intervals.getUpdatedIntervalRange();
+			lo = range[0];
+			hi = range[1];
+		}
+
+		for (int i = lo; i <= hi; i++) {
+
+			final double startTime = intervals.getIntervalTime(i) - absoluteStartTime;
+			final double duration = intervals.getInterval(i);
+			final double finishTime = startTime + duration;
+
+			final double intervalArea = demographicFunction.getIntegral(startTime, finishTime);
+			if (intervalArea == 0 && duration != 0) {
+				contribValid = false;
+				return Double.NEGATIVE_INFINITY;
+			}
+			final int lineageCount = intervals.getLineageCount(i);
+			final double kChoose2 = Binomial.choose2(lineageCount);
+			double c = -kChoose2 * intervalArea;
+
+			if (intervals.getIntervalType(i) == IntervalType.COALESCENT) {
+				final double demographicAtCoalPoint = demographicFunction.getDemographic(finishTime);
+				if (duration == 0.0 || demographicAtCoalPoint * (intervalArea / duration) >= demographicFunction.getThreshold()) {
+					c -= Math.log(demographicAtCoalPoint);
+				} else {
+					contribValid = false;
+					return Double.NEGATIVE_INFINITY;
+				}
+			}
+			intervalContribution[i] = c;
+		}
+
+		double logL = 0.0;
+		for (int i = 0; i < n; i++) {
+			logL += intervalContribution[i];
+		}
+
+		cachedAbsoluteStartTime = absoluteStartTime;
+		demographicChanged = false;
+		contribValid = true;
+		return logL;
+	}
+
 	protected double calculateLogLikelihood(PopulationSizeFunction populationSizeFunction) {
 
 		double logL = 0.0;
@@ -222,6 +320,51 @@ public final class CoalescentLikelihood extends AbstractCoalescentLikelihood imp
 		return logL;
 	}
 
+
+	// **************************************************************
+	// Incremental-cache bookkeeping
+	// **************************************************************
+
+	@Override
+	protected void handleModelChangedEvent(Model model, Object object, int index) {
+		super.handleModelChangedEvent(model, object, index);
+		// A change to anything other than the interval list (i.e. the demographic
+		// or population-size model) affects every interval's contribution, so the
+		// per-interval cache must be fully recomputed.
+		if (!(model instanceof IntervalList)) {
+			demographicChanged = true;
+		}
+	}
+
+	@Override
+	protected void storeState() {
+		super.storeState();
+		storedContribValid = contribValid;
+		storedCachedAbsoluteStartTime = cachedAbsoluteStartTime;
+		storedDemographicChanged = demographicChanged;
+		if (intervalContribution != null) {
+			if (storedIntervalContribution == null || storedIntervalContribution.length != intervalContribution.length) {
+				storedIntervalContribution = intervalContribution.clone();
+			} else {
+				System.arraycopy(intervalContribution, 0, storedIntervalContribution, 0, intervalContribution.length);
+			}
+		}
+	}
+
+	@Override
+	protected void restoreState() {
+		super.restoreState();
+		contribValid = storedContribValid;
+		cachedAbsoluteStartTime = storedCachedAbsoluteStartTime;
+		demographicChanged = storedDemographicChanged;
+		if (storedIntervalContribution != null) {
+			if (intervalContribution == null || intervalContribution.length != storedIntervalContribution.length) {
+				intervalContribution = storedIntervalContribution.clone();
+			} else {
+				System.arraycopy(storedIntervalContribution, 0, intervalContribution, 0, storedIntervalContribution.length);
+			}
+		}
+	}
 
 	public DemographicModel getDemoModel() {
 		return demographicModel;
@@ -286,6 +429,19 @@ public final class CoalescentLikelihood extends AbstractCoalescentLikelihood imp
 	// ****************************************************************
 	// Private and protected stuff
 	// ****************************************************************
+
+	// Incremental cache: per-interval contribution to logL, recomputed only for
+	// intervals the tree change touched. INCREMENTAL=false falls back to the
+	// original full computation (used for A/B timing and as an escape hatch).
+	public static boolean INCREMENTAL = true;
+	private double[] intervalContribution;
+	private double[] storedIntervalContribution;
+	private boolean contribValid = false;
+	private boolean storedContribValid = false;
+	private double cachedAbsoluteStartTime = Double.NaN;
+	private double storedCachedAbsoluteStartTime = Double.NaN;
+	private boolean demographicChanged = true;
+	private boolean storedDemographicChanged = true;
 
 	/** the population size model */
 	private final PopulationSizeModel populationSizeModel;
