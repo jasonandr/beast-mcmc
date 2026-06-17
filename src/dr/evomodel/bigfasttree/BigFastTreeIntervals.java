@@ -48,6 +48,12 @@ import java.util.*;
  * author: JT
  */
 public class BigFastTreeIntervals extends AbstractModel implements Units, TreeIntervalList {
+
+    // Benchmarking hook only. When false, store/restore copy the entire events
+    // structure (the original pre-incremental behaviour). Production default is
+    // true (copy only the touched [dirtyLo, dirtyHi] slice).
+    public static boolean INCREMENTAL_STORE_RESTORE = true;
+
     public BigFastTreeIntervals(TreeModel tree) {
         this("bigFastIntervals",tree);
     }
@@ -74,6 +80,30 @@ public class BigFastTreeIntervals extends AbstractModel implements Units, TreeIn
     public void makeDirty() {
         dirty = true;
         intervalsKnown=false;
+    }
+
+    // **************************************************************
+    // Incremental store/restore support
+    //
+    // [dirtyLo, dirtyHi] (inclusive) tracks the range of event positions in
+    // which `events` may differ from `storedEvents`, so store/restore can copy
+    // only the touched slice rather than the whole O(N) events structure every
+    // MCMC iteration. dirtyLo > dirtyHi denotes an empty range ("in sync").
+    // **************************************************************
+
+    private void markDirty(int lo, int hi) {
+        if (lo < dirtyLo) dirtyLo = lo;
+        if (hi > dirtyHi) dirtyHi = hi;
+    }
+
+    private void markFullyDirty() {
+        dirtyLo = 0;
+        dirtyHi = events.size() - 1;
+    }
+
+    private void markClean() {
+        dirtyLo = events.size();
+        dirtyHi = -1;
     }
 
     @Override
@@ -347,6 +377,7 @@ public class BigFastTreeIntervals extends AbstractModel implements Units, TreeIn
                 lastTime = time;
             }
             intervalsKnown = true;
+            markFullyDirty();
 
         } else if (onlyUpdateTimes) {
             for (int i = 0; i < events.size(); i++) {
@@ -354,7 +385,9 @@ public class BigFastTreeIntervals extends AbstractModel implements Units, TreeIn
                 events.updateEventTime(newTime, i);
             }
             onlyUpdateTimes = false;
+            markFullyDirty();
         } else {
+            // updateForChangedNode extends [dirtyLo, dirtyHi] for each touched slice
             for (int node : updatedNodes) {
                 events.updateForChangedNode(node, tree.getNodeHeight(tree.getNode(node)));
             }
@@ -362,7 +395,7 @@ public class BigFastTreeIntervals extends AbstractModel implements Units, TreeIn
 
         intervalsKnown = true;
         dirty = false;
-        updatedNodes = new ArrayList<>();
+        updatedNodes.clear();
     }
 
     private Type units = Type.GENERATIONS;
@@ -423,12 +456,21 @@ public class BigFastTreeIntervals extends AbstractModel implements Units, TreeIn
 
     @Override
     protected void storeState() {
-        storedUpdatedNodes = new ArrayList<>();
+        storedUpdatedNodes.clear();
         storedUpdatedNodes.addAll(updatedNodes);
-//        Collections.copy(storedUpdatedNodes, updatedNodes);
         storedIntervalsKnown = intervalsKnown;
-        storedEvents.copyEvents(events);
+        // storedEvents differs from events only within [dirtyLo, dirtyHi] (left
+        // over from the previous accepted iteration); re-sync just that slice so
+        // storedEvents becomes a full snapshot, then mark clean.
+        if (INCREMENTAL_STORE_RESTORE) {
+            if (dirtyLo <= dirtyHi) {
+                storedEvents.copyEventsRange(events, dirtyLo, dirtyHi);
+            }
+        } else {
+            storedEvents.copyEvents(events);
+        }
         storedOnlyUpdateTimes = onlyUpdateTimes;
+        markClean();
     }
 
     @Override
@@ -437,11 +479,19 @@ public class BigFastTreeIntervals extends AbstractModel implements Units, TreeIn
         List<Integer> tmp2 = storedUpdatedNodes;
         storedUpdatedNodes = updatedNodes;
         updatedNodes = tmp2;
-        events.copyEvents(storedEvents);
+        // Only [dirtyLo, dirtyHi] of events was changed by this iteration's
+        // proposal; restoring that slice from the snapshot is sufficient.
+        if (INCREMENTAL_STORE_RESTORE) {
+            if (dirtyLo <= dirtyHi) {
+                events.copyEventsRange(storedEvents, dirtyLo, dirtyHi);
+            }
+        } else {
+            events.copyEvents(storedEvents);
+        }
         intervalsKnown = storedIntervalsKnown;
 
         onlyUpdateTimes = storedOnlyUpdateTimes;
-
+        markClean();
     }
 
     @Override
@@ -597,6 +647,15 @@ public class BigFastTreeIntervals extends AbstractModel implements Units, TreeIn
 
             updateTimeAndIntervals(newTime, newPosition);
 
+            // Record the touched span so store/restore can copy only this slice.
+            // The trailing +1 covers the neighbour interval written by
+            // updateTimeAndIntervals at newPosition+1 / oldPostion+1.
+            int lo = Math.min(oldPostion, newPosition);
+            int hi = Math.max(oldPostion, newPosition);
+            if (hi + 1 < numberOfEvents) {
+                hi++;
+            }
+            markDirty(lo, hi);
         }
 
         public void copyEvents(Events source) {
@@ -606,6 +665,25 @@ public class BigFastTreeIntervals extends AbstractModel implements Units, TreeIn
             System.arraycopy(source.lineageCounts, 0, lineageCounts, 0, numberOfEvents);
             System.arraycopy(source.intervalTypes, 0, intervalTypes, 0, numberOfEvents);
             System.arraycopy(source.intervals, 0, intervals, 0, numberOfEvents);
+        }
+
+        /**
+         * Copies only event positions [lo, hi] (inclusive) from source. The five
+         * position-indexed arrays are copied directly; nodeOrder is keyed by node
+         * number so it is rebuilt from the copied nodes[] over the same range (the
+         * set of nodes occupying [lo, hi] is identical in source and destination,
+         * so no entry outside the range can be stale).
+         */
+        public void copyEventsRange(Events source, int lo, int hi) {
+            int len = hi - lo + 1;
+            System.arraycopy(source.nodes, lo, nodes, lo, len);
+            System.arraycopy(source.times, lo, times, lo, len);
+            System.arraycopy(source.lineageCounts, lo, lineageCounts, lo, len);
+            System.arraycopy(source.intervalTypes, lo, intervalTypes, lo, len);
+            System.arraycopy(source.intervals, lo, intervals, lo, len);
+            for (int i = lo; i <= hi; i++) {
+                nodeOrder[nodes[i]] = i;
+            }
         }
 
         /**
@@ -708,6 +786,12 @@ public class BigFastTreeIntervals extends AbstractModel implements Units, TreeIn
     private final TreeModel tree;
     protected boolean dirty;
     private int intervalCount = 0;
+
+    // Range of event positions where `events` may differ from `storedEvents`.
+    // Empty (dirtyLo > dirtyHi) means in sync. Set fully dirty by the
+    // constructor's initial calculateIntervals().
+    private int dirtyLo = 0;
+    private int dirtyHi = -1;
 
 
 }

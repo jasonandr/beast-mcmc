@@ -464,11 +464,28 @@ public class ConstrainedTreeModel extends TreeModel {
 
     private void setParent(int nodeNumber, int parentNumber) {
         edges[(nodeNumber * 3)] = parentNumber;
+        edgesDirty = true;
     }
 
     private void setChild(int nodeNumber, int i, int childNumber) {
         assert i == 0 || i == 1;
         edges[(nodeNumber * 3) + i + 1] = childNumber;
+        edgesDirty = true;
+    }
+
+    // Records that a node's height changed this iteration so store/restore can
+    // touch only the affected entries (see storeState/restoreState).
+    private void recordHeightChange(int nodeNumber) {
+        if (changedHeightCount == changedHeights.length) {
+            changedHeights = java.util.Arrays.copyOf(changedHeights, changedHeights.length * 2);
+        }
+        changedHeights[changedHeightCount++] = nodeNumber;
+    }
+
+    // Forces the next storeState to take a full snapshot.
+    private void markStoreFull() {
+        heightsStoreFull = true;
+        edgesDirty = true;
     }
 
     public void endTreeEditQuietly(){
@@ -573,12 +590,14 @@ public class ConstrainedTreeModel extends TreeModel {
     @Override
     public void setNodeHeight(NodeRef node, double height) {
         heights[node.getNumber()] = height;
+        recordHeightChange(node.getNumber());
         pushTreeChangedEvent(TreeChangedEvent.create(node, true));
     }
 
     @Override
     public void setNodeHeightQuietly(NodeRef n, double height) {
         heights[n.getNumber()] = height;
+        recordHeightChange(n.getNumber());
     }
 
     @Override
@@ -707,11 +726,32 @@ public class ConstrainedTreeModel extends TreeModel {
      */
     @Override
     protected void storeState() {
-        System.arraycopy(edges, 0, storedEdges, 0, edges.length);
-        System.arraycopy(heights, 0, storedHeights, 0, heights.length);
-
-        storedRoot = root;
-
+        if (INCREMENTAL_STORE_RESTORE) {
+            // storedHeights differs from heights only in the entries changed
+            // since the last store; re-sync just those, then mark clean. Edges
+            // are skipped entirely unless the topology changed this iteration.
+            if (heightsStoreFull) {
+                System.arraycopy(heights, 0, storedHeights, 0, heights.length);
+                heightsStoreFull = false;
+            } else {
+                for (int i = 0; i < changedHeightCount; i++) {
+                    int idx = changedHeights[i];
+                    storedHeights[idx] = heights[idx];
+                }
+            }
+            changedHeightCount = 0;
+            if (edgesDirty) {
+                System.arraycopy(edges, 0, storedEdges, 0, edges.length);
+                edgesDirty = false;
+            }
+            storedRoot = root;
+        } else {
+            System.arraycopy(edges, 0, storedEdges, 0, edges.length);
+            System.arraycopy(heights, 0, storedHeights, 0, heights.length);
+            storedRoot = root;
+            changedHeightCount = 0;
+            edgesDirty = false;
+        }
     }
 
     /**
@@ -719,16 +759,29 @@ public class ConstrainedTreeModel extends TreeModel {
      */
     @Override
     protected void restoreState() {
+        if (INCREMENTAL_STORE_RESTORE) {
+            for (int i = 0; i < changedHeightCount; i++) {
+                int idx = changedHeights[i];
+                heights[idx] = storedHeights[idx];
+            }
+            changedHeightCount = 0;
+            if (edgesDirty) {
+                System.arraycopy(storedEdges, 0, edges, 0, edges.length);
+                edgesDirty = false;
+            }
+            root = storedRoot;
+        } else {
+            int[] tmp = storedEdges;
+            storedEdges = edges;
+            edges = tmp;
 
-        int[] tmp = storedEdges;
-        storedEdges = edges;
-        edges = tmp;
+            double[] tmp2 = storedHeights;
+            storedHeights = heights;
+            heights = tmp2;
 
-        double[] tmp2 = storedHeights;
-        storedHeights = heights;
-        heights = tmp2;
-
-        root = storedRoot;
+            root = storedRoot;
+            changedHeightCount = 0;
+        }
     }
 
     /**
@@ -794,6 +847,15 @@ public class ConstrainedTreeModel extends TreeModel {
 
     private double[] heights = null;
     private double[] storedHeights = null;
+
+    // Incremental store/restore bookkeeping (see storeState/restoreState).
+    // Benchmarking hook INCREMENTAL_STORE_RESTORE=false restores the original
+    // full O(N) arraycopy (store) + pointer-swap (restore) behaviour.
+    public static boolean INCREMENTAL_STORE_RESTORE = true;
+    private int[] changedHeights = new int[16];
+    private int changedHeightCount = 0;
+    private boolean heightsStoreFull = true;
+    private boolean edgesDirty = true;
 
     private final NodeRef[] nodes;
 
